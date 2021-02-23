@@ -36,6 +36,7 @@ from collections import Counter
 # - keep track of top results over a certain threshold
 # - remove deepcopies where unnecessary
 # - allow the option to specify a maximum number of "other" roles (e.g. up to one Engineer available)
+# - store things like the history of peer review sessions in a separate file
 
 
 
