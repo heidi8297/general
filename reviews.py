@@ -1,7 +1,10 @@
 import copy
 import statistics
 import itertools
+from line_profiler import LineProfiler
 from collections import Counter
+import random
+import math
 
 
 # This script is used to algorithmically segment a larger group of people into small groups for peer reviews
@@ -14,14 +17,14 @@ from collections import Counter
 #		We keep track of the history of previous peer reviews in order to make this work out appropriately over time
 #	Two, each teammate's reviewers should be of the same squad approximately two-thirds of the time
 #		Same-squad reviews are helpful for cross-training.  they may also have enough background to provide immediately relevant feedback
-#		Reviews from a different squad's teammates help us learn and grow from each other
-#	Three, variation in reviewers is always best.  Penalties should be given for pairing two individuals who were recently paired together
+#		Reviews from a different squad's teammates help us learn and grow from each other's varied perspectives
+#	Three, variation in reviewers is always best.  The algorithm applies a penalty for pairing two individuals who were recently paired together
 #		"full" penalty if they were just paired together, "half" penalty if they were paired together the session before that
 
 # To achieve the same-function reviewer goal (two thirds of the time), additional roles are suggested to "add" to the peer review grouping.
 # In practice this was difficult to achieve because it was difficult to get an accurate headcount with enough notice to invite the right guest reviewers.
 # For example, with only 3 engineers (and only 1-2 regularly participating), it was often difficult to get enough of them to
-#  provide opportunities for the engineers to review each other  and still meet the other objectives outlined above.
+#  provide opportunities for the engineers to review each other and still meet the other objectives outlined above.
 
 
 
@@ -30,42 +33,48 @@ from collections import Counter
 # - very small penalty applied for viz and engineers together (since their work doesn't overlap as much as data/viz or data/engineer)
 # - remove some of the hardcoding around number of people and number of other squad people, plus squad name
 # - improve the readability of the part where the max criteria is calculated
-# - update the way i include "dupcount" so that it scales appropriately
 # - calculate max stdev of reviewer count within squad
 # - determine if the groups can be different sizes (definitely requires significant effort to rework algorithm)
-# - keep track of top results over a certain threshold
-# - remove deepcopies where unnecessary
-# - allow the option to specify a maximum number of "other" roles (e.g. up to one Engineer available)
 # - store things like the history of peer review sessions in a separate file
+# - remove squad dependency from standard deviation of reviewer counts
+# - only complain about not enough presenters if it's an issue for all possible group breakout sizes
+
+
+# THE (NEW) CONSTRAINTS
+# - must include 2-3 presenters in each group
+# - must include no more than one placeholder person
+
+
+# QUESTIONS TO ASK OF NEW PARTICIPANTS
+# full name
+# squad name
+# role (viz, data analytics mgr, data engineer, other (describe))
+# what are you hoping to get out of peer reviews?
 
 
 
 # full list of possible participants (for cutting/pasting)
 #  ['Heidi','Vandana','Humfred','Hari','Sergey','Peter','Nitin','Glenn','Vo','Helena','Kunal','Sandeep','Sai','Johnna']
 
-# people who will participate in this round of peer reviews
-thisRoundFS = ['Heidi','Vandana','Humfred','Peter','Nitin','Glenn','Vo','Johnna']
+
+# define the number of top solutions to show
+topN = 5
 
 # for keeping track of the best key criteria
-bestSolutions = []
-bestSumStdev = 1
+bestSumStdev = 10
 bestSession = []
 bestCriteriaValues = []
-extraRolesNeeded = []
 
 # scalars used for weighting the various criteria
 weightRoleStdev = 0.9
-weightSquadStdev = 1
-weightDups = 0.5
+weightSquadStdev = 0.5
+weightDups = 2.5
 weightRoleAve = 2
 weightRevDist = 0.15
 
-# include any score below this threshold in the list of "top scores"
-#   there must be a better way to do this - I'm just trying to show the top "few" segmentations of the group
-topScoreThreshold = 0.64
 
 # how many people should be in each group?
-groupSize = 4
+groupSize = 5
 
 # how many groups should there be?
 groupCount = 2
@@ -75,43 +84,80 @@ minSameRole = 2
 
 # specify if there are any guest roles (for members to include from other squads) with maximum numbers
 # e.g. it's difficult to include more than one "guest" engineer
-roleMaximums = {'Viz':None,'Data':None,'Engineer':1}
+# roleMaximums = {'Viz':None,'Data':None,'Engineer':1}
+
+
+idealGroupSizes = {    # participantCount: [list of lists where each represents a possible split of group sizes]
+	0: [],
+	1: [],
+	2: [[2]],
+	3: [[3]],
+	4: [[4]],
+	5: [[5]],
+	6: [[6]],
+	7: [[3,4]],
+	8: [[4,4]],
+	9: [[3,3,3],[4,5]],
+	10: [[3,3,4],[5,5]],
+	11: [[3,4,4]],
+	12: [[4,4,4]],
+	13: [[3,3,3,4],[4,4,5]],
+	14: [[3,3,4,4],[4,5,5]],
+	15: [[3,4,4,4],[5,5,5]],
+	16: [[4,4,4,4]],
+	17: [[3,3,3,4,4],[4,4,4,5]],
+	18: [[3,3,4,4,4],[4,4,5,5]],
+	19: [[3,4,4,4,4],[4,5,5,5]],
+	20: [[4,4,4,4,4]],
+	21: [[4,4,4,4,5]],
+	22: [[3,3,4,4,4,4],[4,4,4,5,5]],
+	23: [[3,4,4,4,4,4],[4,4,5,5,5]],
+	24: [[4,4,4,4,4,4],[4,5,5,5,5]],
+	25: [[4,4,4,4,4,5]],
+	26: [[3,3,4,4,4,4,4],[4,4,4,4,5,5]],
+	27: [[3,4,4,4,4,4,4],[4,4,4,5,5,5]]
+}
 
 
 # define all the participants, their roles and their squads
-
 everyone = {
 	# placeholder roles for testing the effects of including someone from another squad
-	'Viz': {'Role':'Viz', 'Squad': 'none'},
-	'Data': {'Role':'Data', 'Squad': 'none'},
-	'Engineer': {'Role':'Engineer', 'Squad': 'none'},
+	'Viz': {'role':'Viz', 'squad': 'none'},
+	'Data': {'role':'Data', 'squad': 'none'},
+	'Engineer': {'role':'Engineer', 'squad': 'none'},
 
 	# squad Fresh Sprints
-	'Heidi': {'Role': 'Viz', 'Squad': 'FS'},
-	'Peter': {'Role': 'Data', 'Squad': 'FS'},
-	'Sergey': {'Role': 'Data', 'Squad': 'FS'},
-	'Sandeep': {'Role': 'Engineer', 'Squad': 'FS'},
-	'Rakesh': {'Role': 'Engineer', 'Squad': 'FS'},
+	'Peter': {'role': 'Data', 'squad': 'FS'},
+	'Sergey': {'role': 'Data', 'squad': 'FS'},
+	'Sandeep': {'role': 'Engineer', 'squad': 'FS'},
+	'Rakesh': {'role': 'Engineer', 'squad': 'FS'},
+	'Vandana': {'role': 'Viz', 'squad': 'FS'},
+	'Seema': {'role': 'Viz', 'squad': 'FS'},
+	'Teenu': {'role': 'Data', 'squad': 'FS'},
+	'Ashirvad': {'role': 'Data', 'squad': 'FS'},
+	'Nitin': {'role': 'Data', 'squad': 'FS'},
 
 	# former team mates (no squad)
-	'Navya': {'Role': 'Data', 'Squad': 'formerFS'},
-	'Al': {'Role': 'Data', 'Squad': 'formerFS'},
-	'Neeharika': {'Role': 'Data', 'Squad': 'formerFS'},
-	'Matt': {'Role': 'Viz', 'Squad': 'formerFS'},
+	'Navya': {'role': 'Data', 'squad': 'formerFS'},
+	'Al': {'role': 'Data', 'squad': 'formerFS'},
+	'Neeharika': {'role': 'Data', 'squad': 'formerFS'},
+	'Matt': {'role': 'Viz', 'squad': 'formerFS'},
 
 	# other squads
-	'Nitin': {'Role': 'Data', 'Squad': 'Sam'},
-	'Vandana': {'Role': 'Viz', 'Squad': 'Sole'},
-	'Kunal': {'Role': 'Data', 'Squad': 'Sam'},
-	'Hari': {'Role': 'Viz', 'Squad': 'Sam'},
-	'Humfred': {'Role': 'Viz', 'Squad': 'Sam'},
-	'Sai': {'Role': 'Engineer', 'Squad': 'Sole'},
-	'Glenn': {'Role': 'Data', 'Squad': 'Sole'},
-	'Vo': {'Role': 'Data', 'Squad': 'Sole'},
-	'Helena': {'Role': 'Data', 'Squad': 'Sam'},
-	'Johnna': {'Role': 'Engineer', 'Squad': 'Sam'},
-	'Manasa': {'Role': 'Engineer', 'Squad': 'Sam'} # no idea what squad
-#	'': {'Role': '', 'Squad': ''}
+	'Heidi': {'role': 'Viz', 'squad': 'Sole'},
+	'Chris': {'role': 'Data', 'squad': 'Sole'},
+	'Namit': {'role': 'Engineer','squad': 'Sole'},
+	'Kunal': {'role': 'Data', 'squad': 'Sam'},
+	'Hari': {'role': 'Viz', 'squad': 'Sam'},
+	'Humfred': {'role': 'Viz', 'squad': 'Sam'},
+	'Sai': {'role': 'Engineer', 'squad': 'Sole'},
+	'Glenn': {'role': 'Data', 'squad': 'Sole'},
+	'Vo': {'role': 'Data', 'squad': 'Sole'},
+	'Helena': {'role': 'Data', 'squad': 'Sam'},
+	'Johnna': {'role': 'Engineer', 'squad': 'Sam'},
+	'Manasa': {'role': 'Engineer', 'squad': 'Sole'},
+	'Brandon': {'role': 'Viz', 'squad': 'DSM'}
+#	'': {'role': '', 'squad': ''}
 }
 
 # history of prior peer reviews   name: presenterYN
@@ -158,213 +204,261 @@ history = [
 ]
 
 for person in everyone:
-	everyone[person]['ReviewedBySameRole'] = 0
-	everyone[person]['ReviewedByOtherRole'] = 0
-	everyone[person]['ReviewedSameRole'] = 0
-	everyone[person]['ReviewedOtherRole'] = 0
-	everyone[person]['ReviewedBySameSquad'] = 0
-	everyone[person]['ReviewedByOtherSquad'] = 0
-	everyone[person]['ReviewedSameSquad'] = 0
-	everyone[person]['ReviewedOtherSquad'] = 0
-	everyone[person]['PeopleReviewedCounts'] = {'Heidi':0,'Matt':0,'Humfred':0}  # I can't remember why I hardcoded this part
-	everyone[person]['PeopleReviewedThisTime'] = []
-	everyone[person]['PeopleReviewedLastTime'] = []
-	everyone[person]['PeopleReviewedLastLastTime'] = []
+	everyone[person]['reviewedBySameRole'] = 0				# how many times has person been reviewed by a person of the same role?
+	everyone[person]['reviewedByOtherRole'] = 0				# how many times has person been reviewed by a person of a different role?
+	everyone[person]['reviewedSameRole'] = 0				# how many times has person reviewed someone of the same role?
+	everyone[person]['reviewedOtherRole'] = 0				# how many times has person reviewed someone of a different role?
+	everyone[person]['reviewedBySameSquad'] = 0				# how many times has person been reviewed by someone from their squad?
+	everyone[person]['reviewedByOtherSquad'] = 0			# how many times has person been reviewed by someone from another squad?
+	everyone[person]['reviewedSameSquad'] = 0				# how many times has person reviewed someone from their squad?
+	everyone[person]['reviewedOtherSquad'] = 0				# how many times has person reviewed someone from anotehr squad?
+	everyone[person]['peopleReviewedCounts'] = {'Heidi':0,'Matt':0,'Humfred':0}  # who has person reviewed and how many times for each?
+	everyone[person]['peopleReviewedThisTime'] = []			# which folks did person review this time?
+	everyone[person]['peopleReviewedLastTime'] = []			# which folks did person review last time?
+	everyone[person]['peopleReviewedLastLastTime'] = []		# which folks did person review the time before last?
 
-def generate_groups(lst, n):
-	if not lst:
-		yield []
-	else:
-		for group in (((lst[0],) + xs) for xs in itertools.combinations(lst[1:], n-1)):
-			for groups in generate_groups([x for x in lst if x not in group], n):
-				yield [group] + groups
 
-def formatSession(unformattedSession):
-	sessionFormatted = []
-	for subsession in unformattedSession:
-		sessionFormatted.append({})
-		for name in subsession:
-			sessionFormatted[-1][name] = 'y'
-	return sessionFormatted
 
+
+def presenterCounts(totalPresCount,groupCount):
+	extraPres = totalPresCount % groupCount
+	minPres = math.floor(totalPresCount/groupCount)
+	maxPres = minPres + 1
+	counts = []
+	for _ in itertools.repeat(None, groupCount - extraPres):
+		counts += [minPres]
+	for _ in itertools.repeat(None, extraPres):
+		counts += [maxPres]
+	return counts
+
+
+def random_permutation(iterable, r=None):
+	"Random selection from itertools.permutations(iterable, r)"
+	pool = tuple(iterable)
+	r = len(pool) if r is None else r
+	return tuple(random.sample(pool, r))
+
+
+# takes an array of tuples of the form [ ({'name':'Heidi','presenter':'y'},{'name':'Glenn','presenter':'y'}) ]
+# and returns an array of tuples of the form [ ('Heidi','Glenn') ]
+def sessionNamesOnly(sessionObjects):
+	cleanerTuples = []
+	for objectTuple in sessionObjects:
+		result = tuple(map(lambda s: s['name'], objectTuple))
+		cleanerTuples.append(result)
+	return cleanerTuples
+
+def sessionHistoryFormat(sessionObjects):
+	historyEntry = []
+	for objectTuple in sessionObjects:
+		result = {}
+		for person in objectTuple:
+			result[person['name']] = person['presenter']
+		historyEntry.append(result)
+	return historyEntry
+
+
+randomGroupings = []
+
+presenters = ["Vandana","Heidi","Peter","Helena","Sai","Glenn","Hari","Kunal","Manasa","Johnna"]
+reviewers = ["Rakesh","Navya","Nitin","Matt","Sergey","Sandeep","Neeharika","Al","Humfred","Vo"]
+
+groupSizes = idealGroupSizes[len(presenters + reviewers)]
+
+presObjects = []
+for name in presenters:
+	presObjects.append({'name':name,'presenter':'y'})
+otherObjects = []
+for name in reviewers:
+	otherObjects.append({'name':name,'presenter':'n'})
+
+
+for _ in itertools.repeat(None, 5000):
+	permPres = random_permutation(presObjects,len(presenters))
+	permOther = random_permutation(otherObjects,len(reviewers))
+	for groupSizeSet in groupSizes:
+		#print("groupSizeSet",groupSizeSet)
+		neededPresenters = 2*len(groupSizeSet) - len(presenters)
+		if neededPresenters > 0:
+			peopleTerm = "person" if neededPresenters == 1 else "people"
+			#print("Insufficent presenters - need",neededPresenters,"more",peopleTerm,"to present their work.")
+			continue
+		presCounts = presenterCounts(len(presenters),len(groupSizeSet))
+		#print('continuing with',groupSizeSet)
+		groupSet = []
+		presIndex = 0
+		otherIndex = 0
+		for groupIndex, groupSize in enumerate(groupSizeSet):
+			thisGroup = permPres[presIndex:presIndex+presCounts[groupIndex]] + permOther[otherIndex:otherIndex+(groupSize - presCounts[groupIndex])]
+			groupSet += [thisGroup]
+
+			presIndex += presCounts[groupIndex]
+			otherIndex += (groupSize - presCounts[groupIndex])
+
+		randomGroupings += [groupSet]
+
+print(len(randomGroupings),"random groupSets created")
+
+
+
+
+# how many pairs of people are paired together this time and were paired together last time as well?
+# divide by the total number of participants to normalize
 def countDups(everyoneList):
 	dupCount = 0
 	# count duplicates between "this time" and "last time"
 	# count duplicates between "this time" and "last last time" (half count for each)
 	for person in everyoneList:
-		dupCount += len(set(everyoneList[person]['PeopleReviewedLastTime']) & set(everyoneList[person]['PeopleReviewedThisTime']))
-		dupCount += 0.5 * len(set(everyoneList[person]['PeopleReviewedLastLastTime']) & set(everyoneList[person]['PeopleReviewedThisTime']))
-	return dupCount
+		dupCount += len(set(everyoneList[person]['peopleReviewedLastTime']) & set(everyoneList[person]['peopleReviewedThisTime']))
+		dupCount += 0.5 * len(set(everyoneList[person]['peopleReviewedLastLastTime']) & set(everyoneList[person]['peopleReviewedThisTime']))
+	return dupCount/len(everyoneList)
 
-def countSameRoles(name,nameList,statsList):
-	count = 0
-	roleOfInterest = statsList[name]['Role']
-	for currentName in nameList:
-		if name != currentName and statsList[currentName]['Role'] == roleOfInterest:
-			count += 1
-	return count
+
 
 def maxStdevOfReviewerCounts(statsList,squadOfInterest):
 	maxStdev = 0
 	for person in statsList:
-		if statsList[person]['Squad'] != squadOfInterest:
+		if statsList[person]['squad'] != squadOfInterest:
 			continue
 		reviewCounts = []
-		for reviewer in statsList[person]['PeopleReviewedCounts']:
-			if statsList[reviewer]['Squad'] == statsList[person]['Squad']:
-				reviewCounts.append(statsList[person]['PeopleReviewedCounts'][reviewer])
-		if statistics.pstdev(reviewCounts) > maxStdev:
+		for reviewer in statsList[person]['peopleReviewedCounts']:
+			if statsList[reviewer]['squad'] == statsList[person]['squad']:
+				reviewCounts.append(statsList[person]['peopleReviewedCounts'][reviewer])
+		if len(reviewCounts) > 0 and statistics.pstdev(reviewCounts) > maxStdev:
 			maxStdev = statistics.pstdev(reviewCounts)
 	return maxStdev
 
 
-
-if groupSize*groupCount-len(thisRoundFS) < 0:
-	print('\n',len(thisRoundFS),'participants listed')
-	print(groupCount,'groups of',groupSize,'is insufficient\n')
-	exit()
-elif groupSize*groupCount-len(thisRoundFS) == 0:
-	print('\n',groupCount,'groups of',groupSize,'is just enough to account for the',len(thisRoundFS),'participants specified')
-	print('no guest reviewers needed at this time')
-else:
-	print('\n','to make',groupCount,'groups of',groupSize,'we will need',groupCount*groupSize-len(thisRoundFS),'guest reviewers')
 
 
 
 for session in history:
 
 	# about to review the next session and add it to each member's history
-	# first let's clear 'PeopleReviewedThisTime' and copy it to 'PeopleReviewedLastTime' so we can compare the two lists for each person
+	# first let's clear 'peopleReviewedThisTime' and copy it to 'peopleReviewedLastTime' so we can compare the two lists for each person
 	for member in everyone:
-		everyone[member]['PeopleReviewedLastLastTime'] = copy.deepcopy(everyone[member]['PeopleReviewedLastTime'])
-		everyone[member]['PeopleReviewedLastTime'] = copy.deepcopy(everyone[member]['PeopleReviewedThisTime'])
-		everyone[member]['PeopleReviewedThisTime'] = []
+		everyone[member]['peopleReviewedLastLastTime'] = copy.copy(everyone[member]['peopleReviewedLastTime'])
+		everyone[member]['peopleReviewedLastTime'] = copy.copy(everyone[member]['peopleReviewedThisTime'])
+		everyone[member]['peopleReviewedThisTime'] = []
 
-
+	# calculate the historical values for 'reviewed by same role', 'reviewed by other role',
+	#   'reviewed by same squad', 'reviewed by other squad', 'people reviewed counts' and 'people reviewed last time'
 	for subsession in session:
 		for presenter in subsession:
 			for reviewer in subsession:
 				if presenter != reviewer and subsession[presenter] == 'y':
-					if everyone[presenter]['Role'] == everyone[reviewer]['Role']:
-						everyone[presenter]['ReviewedBySameRole'] += 1
-						everyone[reviewer]['ReviewedSameRole'] += 1
+					if everyone[presenter]['role'] == everyone[reviewer]['role']:
+						everyone[presenter]['reviewedBySameRole'] += 1
+						everyone[reviewer]['reviewedSameRole'] += 1
 					else:
-						everyone[presenter]['ReviewedByOtherRole'] += 1
-						everyone[reviewer]['ReviewedOtherRole'] += 1
-					if everyone[presenter]['Squad'] == everyone[reviewer]['Squad']:
-						everyone[presenter]['ReviewedBySameSquad'] += 1
-						everyone[reviewer]['ReviewedSameSquad'] += 1
+						everyone[presenter]['reviewedByOtherRole'] += 1
+						everyone[reviewer]['reviewedOtherRole'] += 1
+					if everyone[presenter]['squad'] == everyone[reviewer]['squad']:
+						everyone[presenter]['reviewedBySameSquad'] += 1
+						everyone[reviewer]['reviewedSameSquad'] += 1
 					else:
-						everyone[presenter]['ReviewedByOtherSquad'] += 1
-						everyone[reviewer]['ReviewedOtherSquad'] += 1
-					if presenter in everyone[reviewer]['PeopleReviewedCounts']:
-						everyone[reviewer]['PeopleReviewedCounts'][presenter] += 1
+						everyone[presenter]['reviewedByOtherSquad'] += 1
+						everyone[reviewer]['reviewedOtherSquad'] += 1
+					if presenter in everyone[reviewer]['peopleReviewedCounts']:
+						everyone[reviewer]['peopleReviewedCounts'][presenter] += 1
 					else:
-						everyone[reviewer]['PeopleReviewedCounts'][presenter] = 1
-					
-					everyone[reviewer]['PeopleReviewedThisTime'].append(presenter)
+						everyone[reviewer]['peopleReviewedCounts'][presenter] = 1
 
-
-
-thisRound = []
-for peopleFromOtherSquads in itertools.combinations_with_replacement(['Viz','Data','Engineer'],groupSize*groupCount-len(thisRoundFS)):
-
-	# check to make sure the solution isn't suggesting too many of a certain role type
-	countOfOtherRoles = Counter(peopleFromOtherSquads)
-	unfillableRoles = False
-	for possibleRole in countOfOtherRoles:
-		if roleMaximums[possibleRole] != None and countOfOtherRoles[possibleRole] > roleMaximums[possibleRole]:
-			unfillableRoles = True
-
-	if unfillableRoles:
-		continue
-
-
-	thisRound = thisRoundFS + list(peopleFromOtherSquads)
-
-	possibleNextSessions = list(generate_groups(thisRound, groupSize))
-
-	for nextSession in possibleNextSessions:
-		# first let's determine if the groups with external members have appropriate splits of roles
-		# if we invite a Viz person to join, there should be at least 2 other Viz folks in the group
-		appropriateSplit = True
-		for subsession in nextSession:
-			for fillInRole in ['Viz','Data','Engineer']:
-				if fillInRole in subsession and countSameRoles(fillInRole,subsession,everyone) < minSameRole:
-					appropriateSplit = False
-					break
-		if not appropriateSplit:
-			continue
-
-
-		everyoneCp = copy.deepcopy(everyone)
-
-		# about to review the nextSession and add it to each member's history
-		# first let's clear 'PeopleReviewedThisTime' and copy it to 'PeopleReviewedLastTime' so we can compare the two lists for each person
-		for member in everyoneCp:
-			everyoneCp[member]['PeopleReviewedLastLastTime'] = copy.deepcopy(everyoneCp[member]['PeopleReviewedLastTime'])
-			everyoneCp[member]['PeopleReviewedLastTime'] = copy.deepcopy(everyoneCp[member]['PeopleReviewedThisTime'])
-			everyoneCp[member]['PeopleReviewedThisTime'] = []
-
-		for subsession in formatSession(nextSession):
-			for presenter in subsession:
-				for reviewer in subsession:
-					if presenter != reviewer and subsession[presenter] == 'y':
-						if everyoneCp[presenter]['Role'] == everyoneCp[reviewer]['Role']:
-							everyoneCp[presenter]['ReviewedBySameRole'] += 1
-							everyoneCp[reviewer]['ReviewedSameRole'] += 1
-						else:
-							everyoneCp[presenter]['ReviewedByOtherRole'] += 1
-							everyoneCp[reviewer]['ReviewedOtherRole'] += 1
-						if everyoneCp[presenter]['Squad'] == everyoneCp[reviewer]['Squad']:
-							everyoneCp[presenter]['ReviewedBySameSquad'] += 1
-							everyoneCp[reviewer]['ReviewedSameSquad'] += 1
-						else:
-							everyoneCp[presenter]['ReviewedByOtherSquad'] += 1
-							everyoneCp[reviewer]['ReviewedOtherSquad'] += 1
-						if presenter in everyoneCp[reviewer]['PeopleReviewedCounts']:
-							everyoneCp[reviewer]['PeopleReviewedCounts'][presenter] += 1
-						else:
-							everyoneCp[reviewer]['PeopleReviewedCounts'][presenter] = 1
-						
-						everyoneCp[reviewer]['PeopleReviewedThisTime'].append(presenter)
-
-		# calculate the stdevs, update the "best" variables if better than before
-		ReviewedBySameSquadPercents = []
-		ReviewedBySameRolePercents = []
-		for member in everyoneCp:
-			if everyoneCp[member]['Squad'] == 'FS':
-				ReviewedBySameSquadPercents.append(everyoneCp[member]['ReviewedBySameSquad']/(everyoneCp[member]['ReviewedBySameSquad']+everyoneCp[member]['ReviewedByOtherSquad']))
-				ReviewedBySameRolePercents.append(everyoneCp[member]['ReviewedBySameRole']/(everyoneCp[member]['ReviewedBySameRole']+everyoneCp[member]['ReviewedByOtherRole']))
-
-		dupNum = countDups(everyoneCp)/21.0  # 21 is a function of how many people are on the squad and how many groups we split into
-		roleStdev = statistics.pstdev(ReviewedBySameRolePercents)
-		roleMean = statistics.mean(ReviewedBySameRolePercents)
-		squadStdev = statistics.pstdev(ReviewedBySameSquadPercents)
-		reviewerDist = maxStdevOfReviewerCounts(everyoneCp,'FS')
-
-		totalScore = (weightRoleStdev*roleStdev+weightSquadStdev*squadStdev+weightDups*dupNum+weightRoleAve*(abs(roleMean-0.67))+weightRevDist*reviewerDist)
-		scoreBreakout = [round(num, 5) for num in [weightRoleStdev*roleStdev,weightSquadStdev*squadStdev,weightDups*dupNum,weightRoleAve*abs(roleMean-0.67),weightRevDist*reviewerDist]]
-
-		if totalScore < bestSumStdev:
-			bestSumStdev = totalScore
-			bestSession = nextSession
-			bestCriteriaValues = scoreBreakout
-			extraRolesNeeded = peopleFromOtherSquads
-		if totalScore < topScoreThreshold:
-			bestSolutions.append({'totalScore':round(totalScore,5),'scoreBreakout':scoreBreakout,'session':nextSession,'extrasNeeded':peopleFromOtherSquads})
+					everyone[reviewer]['peopleReviewedThisTime'].append(presenter)
 
 
 
 
-for solution in bestSolutions:
-	print('\ntotalScore:',solution['totalScore'],'   scoreBreakout:',solution['scoreBreakout'],'   guests:',solution['extrasNeeded'])
-	print('session:',solution['session'])
+possibleSolutions = []
+
+for nextSession in randomGroupings:
+	everyoneCp = copy.deepcopy(everyone)
+
+	# about to review the nextSession and add it to each member's history
+	# first let's clear 'peopleReviewedThisTime' and copy it to 'peopleReviewedLastTime' so we can compare the two lists for each person
+	for member in everyoneCp:
+		everyoneCp[member]['peopleReviewedLastLastTime'] = copy.copy(everyoneCp[member]['peopleReviewedLastTime'])
+		everyoneCp[member]['peopleReviewedLastTime'] = copy.copy(everyoneCp[member]['peopleReviewedThisTime'])
+		everyoneCp[member]['peopleReviewedThisTime'] = []
+
+	for subsession in nextSession:
+		for presenterObject in subsession:
+			presenter = presenterObject['name']
+			for reviewerObject in subsession:
+				reviewer = reviewerObject['name']
+				if presenter != reviewer and presenterObject['presenter'] == 'y':
+					if everyoneCp[presenter]['role'] == everyoneCp[reviewer]['role']:
+						everyoneCp[presenter]['reviewedBySameRole'] += 1
+						everyoneCp[reviewer]['reviewedSameRole'] += 1
+					else:
+						everyoneCp[presenter]['reviewedByOtherRole'] += 1
+						everyoneCp[reviewer]['reviewedOtherRole'] += 1
+					if everyoneCp[presenter]['squad'] == everyoneCp[reviewer]['squad']:
+						everyoneCp[presenter]['reviewedBySameSquad'] += 1
+						everyoneCp[reviewer]['reviewedSameSquad'] += 1
+					else:
+						everyoneCp[presenter]['reviewedByOtherSquad'] += 1
+						everyoneCp[reviewer]['reviewedOtherSquad'] += 1
+					if presenter in everyoneCp[reviewer]['peopleReviewedCounts']:
+						everyoneCp[reviewer]['peopleReviewedCounts'][presenter] += 1
+					else:
+						everyoneCp[reviewer]['peopleReviewedCounts'][presenter] = 1
+
+					everyoneCp[reviewer]['peopleReviewedThisTime'].append(presenter)
 
 
-print('\n\n\nbest solution:\nscore:',round(bestSumStdev,5),'   breakout:',bestCriteriaValues,'   guests:',extraRolesNeeded)
-print('session:',bestSession)
-#print("\nbestSumStdev",bestSumStdev)
-#print("bestCriteriaValues",bestCriteriaValues)
-#print("\nbestSession",bestSession)
-#print("extraRolesNeeded",extraRolesNeeded,"\n")
+	# calculate the standard deviations of pairs of same squad and pairs of same role (across all persons)
+	reviewedBySameSquadPercents = []
+	reviewedBySameRolePercents = []
+	for member in everyoneCp:
+		if (everyoneCp[member]['reviewedBySameSquad']+everyoneCp[member]['reviewedByOtherSquad']) > 0:
+			reviewedBySameSquadPercents.append(everyoneCp[member]['reviewedBySameSquad']/(everyoneCp[member]['reviewedBySameSquad']+everyoneCp[member]['reviewedByOtherSquad']))
+		if (everyoneCp[member]['reviewedBySameRole']+everyoneCp[member]['reviewedByOtherRole']) > 0:
+			reviewedBySameRolePercents.append(everyoneCp[member]['reviewedBySameRole']/(everyoneCp[member]['reviewedBySameRole']+everyoneCp[member]['reviewedByOtherRole']))
+
+	dupNum = countDups(everyoneCp)
+	roleStdev = statistics.pstdev(reviewedBySameRolePercents)
+	roleMean = statistics.mean(reviewedBySameRolePercents)
+	squadStdev = statistics.pstdev(reviewedBySameSquadPercents)
+	reviewerDist = maxStdevOfReviewerCounts(everyoneCp,'FS')
+
+	totalScore = (weightRoleStdev*roleStdev+weightSquadStdev*squadStdev+weightDups*dupNum+weightRoleAve*(abs(roleMean-0.67))+weightRevDist*reviewerDist)
+	scoreBreakout = [round(num, 5) for num in [
+		weightRoleStdev*roleStdev,
+		weightSquadStdev*squadStdev,
+		weightDups*dupNum,
+		weightRoleAve*abs(roleMean-0.67),
+		weightRevDist*reviewerDist
+	]]
+
+	if totalScore < bestSumStdev:
+		bestSumStdev = totalScore
+		bestSession = nextSession
+		bestCriteriaValues = scoreBreakout
+	possibleSolutions.append({'session':nextSession, 'totalScore': round(totalScore,5)})
+
+
+
+
+
+
+print('\n\n\nbest solution:\nscore:',round(bestSumStdev,5),'   breakout:',bestCriteriaValues)
+print('session:')
+for group in sessionNamesOnly(bestSession):
+	print("    ",group)
+print("\n\n")
+
+# print("\ntop",topN,"solutions")
+# for solution in sorted(possibleSolutions, key=lambda sol: sol['totalScore'])[:topN]:
+# 	print(solution)
+
+
+input("...")
+
+print("\n",sessionHistoryFormat(bestSession))
+
+# def random_permutation(iterable, r=None):
+#     "Random selection from itertools.permutations(iterable, r)"
+#     pool = tuple(iterable)
+#     r = len(pool) if r is None else r
+#     return tuple(random.sample(pool, r))
